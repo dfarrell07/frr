@@ -147,3 +147,12 @@ tests_bgpd_test_gr_replay_CPPFLAGS = $(TESTS_CPPFLAGS)
 tests_bgpd_test_gr_replay_LDADD = $(BGP_TEST_LDADD)
 tests_bgpd_test_gr_replay_SOURCES = tests/bgpd/test_gr_replay.c
 EXTRA_DIST += tests/bgpd/test_gr_replay.py
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_gr_eor
+endif
+tests_bgpd_test_gr_eor_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_gr_eor_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_gr_eor_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_gr_eor_SOURCES = tests/bgpd/test_gr_eor.c
+EXTRA_DIST += tests/bgpd/test_gr_eor.py
