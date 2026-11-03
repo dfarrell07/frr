@@ -5,6 +5,7 @@
 #include "frrevent.h"
 #include "linklist.h"
 #include "memory.h"
+#include "network.h"
 #include "prefix.h"
 #include "privs.h"
 #include "stream.h"
@@ -315,7 +316,9 @@ static void test_original_deadline(void)
 #ifdef BGP_NEXTHOP_INITIAL_PENDING
 	SET_FLAG(nht.flags, BGP_NEXTHOP_INITIAL_PENDING);
 #endif
-	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) == 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+	assert(set_nonblocking(sockets[0]) == 0);
+	assert(set_nonblocking(sockets[1]) == 0);
 	bgp_zclient = zclient_new(master, &zclient_options_default, NULL, 0);
 	bgp_zclient->sock = sockets[0];
 	bgp.select_defer_time = 1;

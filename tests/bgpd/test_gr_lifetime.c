@@ -6,6 +6,7 @@
 #undef DEBUG_ON /* bgpd supplies its own macro. */
 #include "frr_pthread.h"
 #include "frrevent.h"
+#include "network.h"
 #include "northbound.h"
 #include "privs.h"
 #include "qobj.h"
@@ -124,7 +125,9 @@ static int attach_socket(void)
 	int sockets[2], size = 4096;
 
 	zclient_stop(bgp_zclient);
-	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) == 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+	assert(set_nonblocking(sockets[0]) == 0);
+	assert(set_nonblocking(sockets[1]) == 0);
 	assert(setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)) == 0);
 	bgp_zclient->sock = sockets[0];
 	return sockets[1];
