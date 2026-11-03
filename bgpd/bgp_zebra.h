@@ -41,6 +41,7 @@ extern void bgp_zebra_destroy(void);
 extern int bgp_zebra_get_table_range(struct zclient *zc, uint32_t chunk_size,
 				     uint32_t *start, uint32_t *end);
 extern int bgp_if_update_all(void);
+extern void bgp_zebra_gr_complete(struct bgp_dest *dest);
 extern void bgp_zebra_route_install(struct bgp_dest *dest,
 				    struct bgp_path_info *path, struct bgp *bgp,
 				    bool install, struct bgpevpn *vpn,

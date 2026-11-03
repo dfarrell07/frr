@@ -637,6 +637,7 @@ static void bgp_process_nexthop_update(struct bgp_nexthop_cache *bnc,
 	int i;
 	bool evpn_resolved = false;
 
+	UNSET_FLAG(bnc->flags, BGP_NEXTHOP_INITIAL_PENDING);
 	bnc->last_update = monotime(NULL);
 	bnc->change_flags = 0;
 
@@ -821,6 +822,7 @@ static void bgp_nht_ifp_table_handle(struct bgp *bgp,
 		    (bnc->ifindex_ipv6_ll != ifp->ifindex))
 			continue;
 
+		UNSET_FLAG(bnc->flags, BGP_NEXTHOP_INITIAL_PENDING);
 		bnc->last_update = monotime(NULL);
 		bnc->change_flags = 0;
 
@@ -1249,8 +1251,13 @@ static void register_zebra_rnh(struct bgp_nexthop_cache *bnc)
 	if (CHECK_FLAG(bnc->flags, BGP_NEXTHOP_REGISTERED))
 		return;
 
+	SET_FLAG(bnc->flags, BGP_NEXTHOP_INITIAL_PENDING);
+
 	if (bnc->ifindex_ipv6_ll) {
 		SET_FLAG(bnc->flags, BGP_NEXTHOP_REGISTERED);
+		/* Local registrations also require an initial interface result. */
+		event_add_event(bm->master, bgp_nht_ifp_initial, bnc->bgp,
+				bnc->ifindex_ipv6_ll, NULL);
 		return;
 	}
 

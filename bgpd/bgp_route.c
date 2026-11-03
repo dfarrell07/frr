@@ -4286,29 +4286,166 @@ void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, saf
 	return;
 }
 
+bool bgp_dest_initial_nht_pending(struct bgp_dest *dest)
+{
+	struct bgp_path_info *pi;
+	bool pending = false;
+
+	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
+		if (CHECK_FLAG(pi->flags, BGP_PATH_REMOVED | BGP_PATH_HISTORY))
+			continue;
+		/* A usable alternate already preserves forwarding for this prefix. */
+		if (!BGP_PATH_HOLDDOWN(pi) && pi->peer &&
+		    (!pi->nexthop ||
+		     !CHECK_FLAG(pi->nexthop->flags, BGP_NEXTHOP_INITIAL_PENDING)) &&
+		    (pi->peer == pi->peer->bgp->peer_self ||
+		     peer_established(pi->peer->connection) ||
+		     CHECK_FLAG(pi->peer->sflags, PEER_STATUS_NSF_WAIT)))
+			return false;
+		if (pi->nexthop && CHECK_FLAG(pi->nexthop->flags, BGP_NEXTHOP_INITIAL_PENDING))
+			pending = true;
+	}
+	return pending;
+}
+
+static bool bgp_table_initial_nht_pending(struct bgp_table *table)
+{
+	struct bgp_dest *dest;
+
+	if (!table)
+		return false;
+	for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
+		if (bgp_dest_initial_nht_pending(dest)) {
+			bgp_dest_unlock_node(dest);
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool bgp_gr_initial_nht_pending(struct bgp *bgp, afi_t afi, safi_t safi)
+{
+	struct bgp_dest *rd;
+	struct bgp_table *table = bgp->rib[afi][safi];
+
+	/* Include prefixes queued before deferral, which are not in gr_deferred. */
+	if (safi != SAFI_EVPN && safi != SAFI_MPLS_VPN && safi != SAFI_ENCAP)
+		return bgp_table_initial_nht_pending(table);
+	for (rd = bgp_table_top(table); rd; rd = bgp_route_next(rd)) {
+		if (bgp_table_initial_nht_pending(bgp_dest_get_bgp_table_info(rd))) {
+			bgp_dest_unlock_node(rd);
+			return true;
+		}
+	}
+	return false;
+}
+
+static inline void bgp_gr_start_route_select_timer(struct bgp *bgp, afi_t afi, safi_t safi);
+
+static bool bgp_gr_completion_ready(struct bgp *bgp, afi_t afi, safi_t safi)
+{
+	struct graceful_restart_info *gr = &bgp->gr_info[afi][safi];
+
+	return !CHECK_FLAG(bgp->flags, BGP_FLAG_DELETE_IN_PROGRESS) &&
+	       !gr->gr_deferred && BGP_GR_SELECT_DEFER_DONE(bgp, afi, safi) &&
+	       !(BGP_GR_SELECT_DEFERRAL_TIMER_IS_RUNNING(bgp, afi, safi) &&
+		 bgp_gr_initial_nht_pending(bgp, afi, safi)) &&
+	       (!BGP_SUPPRESS_FIB_ENABLED(bgp) || !gr->t_select_deferral ||
+		!gr->gr_route_fib_install_pending_cnt);
+}
+
+void bgp_gr_completion_marker_free(struct bgp_dest *dest)
+{
+	struct bgp_eoiu_info *info = bgp_dest_get_bgp_eoiu_info(dest);
+
+	XFREE(MTYPE_BGP_EOIU_MARKER_INFO, info);
+	XFREE(MTYPE_BGP_NODE, dest);
+}
+
+bool bgp_gr_completion_marker_valid(struct bgp_dest *dest)
+{
+	struct bgp_eoiu_info *info = bgp_dest_get_bgp_eoiu_info(dest);
+	struct graceful_restart_info *gr = &info->bgp->gr_info[info->afi][info->safi];
+
+	if (info->generation != gr->generation)
+		return false;
+	if (bgp_gr_completion_ready(info->bgp, info->afi, info->safi))
+		return true;
+
+	gr->completion_queued = false;
+	if (BGP_GR_SELECT_DEFER_DONE(info->bgp, info->afi, info->safi) && !gr->t_route_select)
+		bgp_gr_start_route_select_timer(info->bgp, info->afi, info->safi);
+	return false;
+}
+
 void bgp_process_gr_deferral_complete(struct bgp *bgp, afi_t afi, safi_t safi)
 {
-	bool route_sync_pending = false;
+	struct graceful_restart_info *gr = &bgp->gr_info[afi][safi];
+	struct bgp_dest *dest;
+	struct bgp_eoiu_info *info;
 
-	bgp_send_delayed_eor(bgp);
-
-	/*
-	 * Check if tier2 timer needs to be started if this
-	 * afi-safi is enabled for multihop peer
+	/* First-tier route synchronization must also wake update generation for
+	 * multihop peers; it is independent of the final Zebra COMPLETE fence.
 	 */
+	bgp_send_delayed_eor(bgp);
 	bgp_gr_start_tier2_timer_if_required(bgp, afi, safi);
-
-	/* Send route processing complete message to RIB */
-	if (!bgp->gr_info[afi][safi].route_sync_tier2 && BGP_GR_SELECT_DEFER_DONE(bgp, afi, safi)) {
-		bgp_zebra_update(bgp, afi, safi, ZEBRA_CLIENT_ROUTE_UPDATE_COMPLETE);
-		bgp->gr_info[afi][safi].route_sync_tier2 = true;
+	gr->route_sync = true;
+	if (gr->route_sync_tier2 || gr->completion_queued)
+		return;
+	if (!bgp_gr_completion_ready(bgp, afi, safi)) {
+		if (!gr->t_route_select && BGP_GR_SELECT_DEFER_DONE(bgp, afi, safi))
+			bgp_gr_start_route_select_timer(bgp, afi, safi);
+		return;
 	}
 
-	bgp->gr_info[afi][safi].route_sync = true;
-	/*
-	 * If this instance is all done,
-	 * check for GR completion overall
+	/* Drain both processing subqueues, then serialize the marker after
+	 * their route announcements. Include work queued before GR deferral.
 	 */
+	dest = XCALLOC(MTYPE_BGP_NODE, sizeof(*dest));
+	info = XCALLOC(MTYPE_BGP_EOIU_MARKER_INFO, sizeof(*info));
+	info->bgp = bgp;
+	info->gr_complete = true;
+	info->afi = afi;
+	info->safi = safi;
+	info->generation = gr->generation;
+	for (uint8_t i = 0; i < META_QUEUE_EOIU_MARKER; i++)
+		info->process_tail[i] = STAILQ_LAST(bgp->mq->subq[i], bgp_dest, pq);
+	SET_FLAG(dest->flags, BGP_NODE_GR_COMPLETION_MARKER);
+	bgp_dest_set_bgp_eoiu_info(dest, info);
+	gr->completion_queued = true;
+	eoiu_marker_process(bgp, dest);
+}
+
+void bgp_gr_completion_marker_finish(struct bgp_dest *dest)
+{
+	struct bgp_eoiu_info *info = bgp_dest_get_bgp_eoiu_info(dest);
+	struct bgp *bgp = info->bgp;
+	afi_t afi = info->afi;
+	safi_t safi = info->safi;
+	struct graceful_restart_info *gr = &bgp->gr_info[afi][safi];
+	bool route_sync_pending = false;
+	struct event **timers[] = {&gr->t_select_deferral, &gr->t_select_deferral_tier2,
+				  &gr->t_route_select};
+
+	if (!bgp_gr_completion_marker_valid(dest))
+		return;
+	gr->completion_queued = false;
+	if (bgp_zebra_update(bgp, afi, safi, ZEBRA_CLIENT_ROUTE_UPDATE_COMPLETE) !=
+	    BGP_GR_SUCCESS) {
+		if (!gr->t_route_select)
+			bgp_gr_start_route_select_timer(bgp, afi, safi);
+		return;
+	}
+	gr->route_sync_tier2 = true;
+	for (size_t i = 0; i < array_size(timers); i++) {
+		if (*timers[i]) {
+			void *arg = EVENT_ARG(*timers[i]);
+
+			XFREE(MTYPE_TMP, arg);
+		}
+		event_cancel(timers[i]);
+	}
+
 	FOREACH_AFI_SAFI (afi, safi) {
 		if (bgp->gr_info[afi][safi].af_enabled &&
 		    !bgp->gr_info[afi][safi].route_sync_tier2) {
@@ -4316,13 +4453,12 @@ void bgp_process_gr_deferral_complete(struct bgp *bgp, afi_t afi, safi_t safi)
 			break;
 		}
 	}
-
 	if (!route_sync_pending) {
 		bgp->gr_route_sync_pending = false;
-		/* Set bgp master GR COMPLETE flag */
 		frrtrace(3, frr_bgp, gr_update_complete, bgp->name_pretty, afi, safi);
 		bgp_update_gr_completion();
 	}
+	bgp_send_delayed_eor(bgp);
 }
 
 /* This function increments gr_route_fib_install_pending_cnt if needed based on BGP_NODE_FIB_INSTALL_PENDING flag */
@@ -4383,14 +4519,6 @@ void bgp_dest_decrement_gr_fib_install_pending_count(struct bgp_dest *dest)
 	if (!bgp->gr_info[afi][safi].gr_deferred &&
 	    !bgp->gr_info[afi][safi].gr_route_fib_install_pending_cnt &&
 	    bgp->gr_route_sync_pending) {
-		struct graceful_restart_info *gr_info = &(bgp->gr_info[afi][safi]);
-
-		if (gr_info->t_select_deferral) {
-			void *info = EVENT_ARG(gr_info->t_select_deferral);
-
-			XFREE(MTYPE_TMP, info);
-		}
-		event_cancel(&gr_info->t_select_deferral);
 		if (BGP_DEBUG(graceful_restart, GRACEFUL_RESTART))
 			zlog_debug("%s: Triggering GR deferral completion from FIB notification for %s",
 				   bgp->name_pretty, get_afi_safi_str(afi, safi, false));
@@ -4685,10 +4813,12 @@ void bgp_do_deferred_path_selection(struct bgp *bgp, afi_t afi, safi_t safi)
 	 * not running or has expired.
 	 */
 	if (!bgp->gr_info[afi][safi].gr_deferred) {
-		/* t_select_deferral will be NULL when either gr_route_fib_install_pending_cnt is 0
-		 * or deferral timer for fib install expires
+		/* Suppress-FIB waits for acknowledgements until its original
+		 * deadline. Completion markers serialize prior route work.
 		 */
-		if (!BGP_SUPPRESS_FIB_ENABLED(bgp) || !bgp->gr_info[afi][safi].t_select_deferral)
+		if (!BGP_SUPPRESS_FIB_ENABLED(bgp) ||
+		    !bgp->gr_info[afi][safi].t_select_deferral ||
+		    !bgp->gr_info[afi][safi].gr_route_fib_install_pending_cnt)
 			bgp_process_gr_deferral_complete(bgp, afi, safi);
 	} else {
 		/*
@@ -4763,10 +4893,15 @@ static void process_eoiu_marker(struct bgp_dest *dest)
 		zlog_debug("EOIU Marker dequeued from sub-queue %s",
 			   subqueue2str(META_QUEUE_EOIU_MARKER));
 
-	bgp_process_main_one(info->bgp, NULL, 0, 0);
+	if (info->gr_complete) {
+		if (bgp_gr_completion_marker_valid(dest)) {
+			bgp_zebra_gr_complete(dest);
+			return;
+		}
+	} else
+		bgp_process_main_one(info->bgp, NULL, 0, 0);
 
-	XFREE(MTYPE_BGP_EOIU_MARKER_INFO, info);
-	XFREE(MTYPE_BGP_NODE, dest);
+	bgp_gr_completion_marker_free(dest);
 }
 
 /*
@@ -4801,9 +4936,113 @@ static unsigned int process_subq(struct bgp_dest_queue *subq, enum meta_queue_in
  * a non-empty sub-queue with lowest priority. wq is equal to bgp->process_queue and
  * data is pointed to the meta queue structure.
  */
+/* The first GR marker bounds the work that can precede it. Later updates
+ * cannot starve the marker, even when they keep a route subqueue nonempty.
+ */
+static struct bgp_eoiu_info *meta_queue_gr_fence(struct meta_queue *mq)
+{
+	struct bgp_dest *dest;
+
+	STAILQ_FOREACH (dest, mq->subq[META_QUEUE_EOIU_MARKER], pq) {
+		struct bgp_eoiu_info *info = bgp_dest_get_bgp_eoiu_info(dest);
+
+		if (info && info->gr_complete)
+			return info;
+	}
+	return NULL;
+}
+
+/* Causal work is inserted before the earliest frontier, rather than admitting
+ * unrelated jobs that arrived after the completion request.
+ */
+static void meta_queue_add_route(struct meta_queue *mq, struct bgp_dest *dest, uint8_t qindex)
+{
+	struct bgp_eoiu_info *fence = mq->in_process ? meta_queue_gr_fence(mq) : NULL;
+	struct bgp_dest *tail = fence ? fence->process_tail[qindex] : NULL;
+	struct bgp_dest *marker;
+
+	if (!fence)
+		STAILQ_INSERT_TAIL(mq->subq[qindex], dest, pq);
+	else {
+		if (tail)
+			STAILQ_INSERT_AFTER(mq->subq[qindex], tail, dest, pq);
+		else
+			STAILQ_INSERT_HEAD(mq->subq[qindex], dest, pq);
+		STAILQ_FOREACH (marker, mq->subq[META_QUEUE_EOIU_MARKER], pq) {
+			struct bgp_eoiu_info *info = bgp_dest_get_bgp_eoiu_info(marker);
+
+			if (!info || !info->gr_complete)
+				continue;
+			if (info->process_tail[qindex] == tail)
+				info->process_tail[qindex] = dest;
+		}
+	}
+	mq->size++;
+}
+
+/* Coalescing into an already queued post-frontier destination must promote
+ * that job too. Each frontier is the queue prefix ending at its saved tail.
+ */
+static void meta_queue_promote_route(struct meta_queue *mq, struct bgp_dest *dest)
+{
+	struct bgp_eoiu_info *fence = mq->in_process ? meta_queue_gr_fence(mq) : NULL;
+	struct bgp_dest *item, *previous, *tail, *marker;
+	bool included;
+
+	if (!fence)
+		return;
+	for (uint8_t qindex = 0; qindex < META_QUEUE_EOIU_MARKER; qindex++) {
+		tail = fence->process_tail[qindex];
+		included = tail != NULL;
+		previous = NULL;
+		STAILQ_FOREACH (item, mq->subq[qindex], pq) {
+			if (item == dest)
+				break;
+			if (item == tail)
+				included = false;
+			previous = item;
+		}
+		if (!item)
+			continue;
+		if (included)
+			return;
+		if (previous != tail) {
+			STAILQ_REMOVE(mq->subq[qindex], dest, bgp_dest, pq);
+			if (tail)
+				STAILQ_INSERT_AFTER(mq->subq[qindex], tail, dest, pq);
+			else
+				STAILQ_INSERT_HEAD(mq->subq[qindex], dest, pq);
+		}
+		STAILQ_FOREACH (marker, mq->subq[META_QUEUE_EOIU_MARKER], pq) {
+			struct bgp_eoiu_info *info = bgp_dest_get_bgp_eoiu_info(marker);
+
+			if (!info || !info->gr_complete)
+				continue;
+			if (previous != tail && info->process_tail[qindex] == dest)
+				info->process_tail[qindex] = previous;
+			if (info->process_tail[qindex] == tail)
+				info->process_tail[qindex] = dest;
+		}
+		return;
+	}
+}
+
+static void meta_queue_forget_tail(struct meta_queue *mq, uint8_t qindex, struct bgp_dest *dest)
+{
+	struct bgp_dest *marker;
+
+	STAILQ_FOREACH (marker, mq->subq[META_QUEUE_EOIU_MARKER], pq) {
+		struct bgp_eoiu_info *info = bgp_dest_get_bgp_eoiu_info(marker);
+
+		if (info && info->gr_complete && info->process_tail[qindex] == dest)
+			info->process_tail[qindex] = NULL;
+	}
+}
+
 static wq_item_status meta_queue_process(struct work_queue *dummy, void *data)
 {
 	struct meta_queue *mq = data;
+	struct bgp_eoiu_info *fence;
 	uint32_t i;
 	uint32_t peers_on_fifo;
 	static uint32_t total_runs = 0;
@@ -4823,11 +5062,21 @@ static wq_item_status meta_queue_process(struct work_queue *dummy, void *data)
 	if (peers_on_fifo > 10 && total_runs % 10 != 0)
 		return WQ_QUEUE_BLOCKED;
 
-	for (i = 0; i < MQ_SIZE; i++)
-		if (process_subq(mq->subq[i], i)) {
-			mq->size--;
-			break;
-		}
+	fence = meta_queue_gr_fence(mq);
+	for (i = 0; i < MQ_SIZE; i++) {
+		if (fence && i < META_QUEUE_EOIU_MARKER && !fence->process_tail[i])
+			continue;
+		struct bgp_dest *head = STAILQ_FIRST(mq->subq[i]);
+
+		if (!head)
+			continue;
+		meta_queue_forget_tail(mq, i, head);
+		mq->in_process = true;
+		process_subq(mq->subq[i], i);
+		mq->in_process = false;
+		mq->size--;
+		break;
+	}
 
 	return mq->size ? WQ_REQUEUE : WQ_SUCCESS;
 }
@@ -4842,8 +5091,7 @@ static int early_route_meta_queue_add(struct meta_queue *mq, void *data)
 			   subqueue2str(qindex));
 
 	assert(STAILQ_NEXT(dest, pq) == NULL);
-	STAILQ_INSERT_TAIL(mq->subq[qindex], dest, pq);
-	mq->size++;
+	meta_queue_add_route(mq, dest, qindex);
 	return 0;
 }
 
@@ -4857,8 +5105,7 @@ static int other_route_meta_queue_add(struct meta_queue *mq, void *data)
 			   subqueue2str(qindex));
 
 	assert(STAILQ_NEXT(dest, pq) == NULL);
-	STAILQ_INSERT_TAIL(mq->subq[qindex], dest, pq);
-	mq->size++;
+	meta_queue_add_route(mq, dest, qindex);
 	return 0;
 }
 
@@ -5062,6 +5309,7 @@ static void bgp_process_internal(struct bgp *bgp, struct bgp_dest *dest,
 	/* already scheduled for processing? */
 	if (CHECK_FLAG(dest->flags, BGP_NODE_PROCESS_SCHEDULED)) {
 		bgp->node_already_on_queue++;
+		meta_queue_promote_route(bgp->mq, dest);
 		return;
 	}
 

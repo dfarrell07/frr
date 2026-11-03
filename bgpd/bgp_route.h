@@ -600,6 +600,8 @@ enum bgp_path_type {
 struct meta_queue {
 	STAILQ_HEAD(bgp_dest_queue, bgp_dest) * subq[MQ_SIZE];
 	uint32_t size; /* sum of lengths of all subqueues */
+	/* Include synchronous derived work in pending GR frontiers. */
+	bool in_process;
 };
 
 /*
@@ -613,6 +615,13 @@ struct meta_queue {
  */
 struct bgp_eoiu_info {
 	struct bgp *bgp;
+	/* GR markers pass through processing and then the Zebra FIFO. */
+	bool gr_complete;
+	/* Last included destination in each route subqueue; NULL when drained. */
+	struct bgp_dest *process_tail[MQ_SIZE];
+	afi_t afi;
+	safi_t safi;
+	uint64_t generation;
 };
 
 /*
@@ -1020,6 +1029,10 @@ extern int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 #define bgp_path_info_add(A, B)                                                \
 	bgp_path_info_add_with_caller(__func__, (A), (B))
 #define bgp_path_info_free(B) bgp_path_info_free_with_caller(__func__, (B))
+extern bool bgp_dest_initial_nht_pending(struct bgp_dest *dest);
+extern void bgp_gr_completion_marker_free(struct bgp_dest *dest);
+extern bool bgp_gr_completion_marker_valid(struct bgp_dest *dest);
+extern void bgp_gr_completion_marker_finish(struct bgp_dest *dest);
 extern void bgp_meta_queue_free(struct meta_queue *mq);
 extern int early_route_process(struct bgp *bgp, struct bgp_dest *dest);
 extern int other_route_process(struct bgp *bgp, struct bgp_dest *dest);

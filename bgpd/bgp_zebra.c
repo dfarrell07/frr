@@ -1869,6 +1869,13 @@ static void bgp_handle_route_announcements_to_zebra(struct event *e)
 		if (!dest)
 			break;
 
+		if (CHECK_FLAG(dest->flags, BGP_NODE_GR_COMPLETION_MARKER)) {
+			bgp_gr_completion_marker_finish(dest);
+			bgp_gr_completion_marker_free(dest);
+			count++;
+			continue;
+		}
+
 		table = bgp_dest_table(dest);
 		install = CHECK_FLAG(dest->flags, BGP_NODE_SCHEDULE_FOR_INSTALL);
 		if (table->afi == AFI_L2VPN && table->safi == SAFI_EVPN) {
@@ -1949,6 +1956,14 @@ static void bgp_handle_route_announcements_to_zebra(struct event *e)
 static void bgp_zebra_buffer_write_ready(void)
 {
 	bgp_handle_route_announcements_to_zebra(NULL);
+}
+
+/* Serialize COMPLETE after prior route messages, including buffered writes. */
+void bgp_zebra_gr_complete(struct bgp_dest *dest)
+{
+	zebra_announce_add_tail(&bm->zebra_announce_head, dest);
+	event_add_event(bm->master, bgp_handle_route_announcements_to_zebra,
+			NULL, 0, &bm->t_bgp_zebra_route);
 }
 
 void bgp_zebra_update_fib_install_pending(struct bgp_dest *dest, struct bgp *bgp, bool install)

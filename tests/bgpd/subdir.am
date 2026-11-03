@@ -79,3 +79,21 @@ tests_bgpd_test_peer_attr_CPPFLAGS = $(TESTS_CPPFLAGS)
 tests_bgpd_test_peer_attr_LDADD = $(BGP_TEST_LDADD)
 tests_bgpd_test_peer_attr_SOURCES = tests/bgpd/test_peer_attr.c
 EXTRA_DIST += tests/bgpd/test_peer_attr.py
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_gr_completion
+endif
+tests_bgpd_test_gr_completion_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_gr_completion_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_gr_completion_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_gr_completion_SOURCES = tests/bgpd/test_gr_completion.c
+EXTRA_DIST += tests/bgpd/test_gr_completion.py
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_gr_lifetime
+endif
+tests_bgpd_test_gr_lifetime_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_gr_lifetime_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_gr_lifetime_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_gr_lifetime_SOURCES = tests/bgpd/test_gr_lifetime.c
+EXTRA_DIST += tests/bgpd/test_gr_lifetime.py

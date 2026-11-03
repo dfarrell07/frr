@@ -4194,6 +4194,15 @@ int bgp_delete(struct bgp *bgp)
 	for (dest = zebra_announce_first(&bm->zebra_announce_head); dest;
 	     dest = dest_next) {
 		dest_next = zebra_announce_next(&bm->zebra_announce_head, dest);
+		if (CHECK_FLAG(dest->flags, BGP_NODE_GR_COMPLETION_MARKER)) {
+			struct bgp_eoiu_info *info = bgp_dest_get_bgp_eoiu_info(dest);
+
+			if (info->bgp == bgp) {
+				zebra_announce_del(&bm->zebra_announce_head, dest);
+				bgp_gr_completion_marker_free(dest);
+			}
+			continue;
+		}
 		dest_table = bgp_dest_table(dest);
 		if (dest_table->bgp == bgp) {
 			zebra_announce_del(&bm->zebra_announce_head, dest);
@@ -4306,6 +4315,14 @@ int bgp_delete(struct bgp *bgp)
 			XFREE(MTYPE_TMP, info);
 		}
 		event_cancel(&gr_info->t_select_deferral);
+
+		t = gr_info->t_select_deferral_tier2;
+		if (t) {
+			void *info = EVENT_ARG(t);
+
+			XFREE(MTYPE_TMP, info);
+		}
+		event_cancel(&gr_info->t_select_deferral_tier2);
 
 		t = gr_info->t_route_select;
 		if (t) {
@@ -4498,6 +4515,9 @@ int bgp_delete(struct bgp *bgp)
 		else
 			bgp_set_evpn(bgp_get_default());
 	}
+
+	/* Retire callbacks with raw instance pointers, including initial NHT. */
+	event_cancel_event_ready(bm->master, bgp);
 
 	if (!IS_BGP_INSTANCE_HIDDEN(bgp) || bm->terminating) {
 		if (bgp->process_queue)

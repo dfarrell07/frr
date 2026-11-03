@@ -925,6 +925,8 @@ void bgp_start_tier2_deferral_timer(struct bgp *bgp, afi_t afi, safi_t safi)
 	 * peers finish and sends UPDATE_COMPLETE before the multihop
 	 * End-of-RIB.
 	 */
+	gr_info->generation++;
+	gr_info->completion_queued = false;
 	gr_info->select_defer_over_tier2 = false;
 	gr_info->route_sync_tier2 = false;
 	gr_info->select_defer_tier2_required = true;
@@ -946,6 +948,7 @@ static void bgp_graceful_deferral_timer_expire(struct event *event)
 	safi_t safi;
 	struct bgp *bgp;
 	bool multihop_eors_pending = false;
+	bool tier2_gr;
 
 	info = EVENT_ARG(event);
 	afi = info->afi;
@@ -962,6 +965,10 @@ static void bgp_graceful_deferral_timer_expire(struct event *event)
 	else
 		bgp->gr_info[afi][safi].select_defer_over = true;
 
+	tier2_gr = info->tier2_gr;
+
+	XFREE(MTYPE_TMP, info);
+
 	/* Check if graceful restart deferral completion is needed */
 	if (BGP_SUPPRESS_FIB_ENABLED(bgp) &&
 	    bgp_gr_check_all_eors(bgp, afi, safi, &multihop_eors_pending) &&
@@ -976,14 +983,12 @@ static void bgp_graceful_deferral_timer_expire(struct event *event)
 	/* Best path selection */
 	if (BGP_DEBUG(graceful_restart, GRACEFUL_RESTART))
 		zlog_debug("%s: Starting %s deferred path selection for %s, #routes %d -- timeout",
-			   bgp->name_pretty, (info->tier2_gr) ? "2nd" : "1st",
+			   bgp->name_pretty, (tier2_gr) ? "2nd" : "1st",
 			   get_afi_safi_str(afi, safi, false), bgp->gr_info[afi][safi].gr_deferred);
 
-	frrtrace(5, frr_bgp, gr_deferral_timer_expiry, bgp->name_pretty, info->tier2_gr, afi, safi,
+	frrtrace(5, frr_bgp, gr_deferral_timer_expiry, bgp->name_pretty, tier2_gr, afi, safi,
 		 bgp->gr_info[afi][safi].gr_deferred);
 
-
-	XFREE(MTYPE_TMP, info);
 
 	bgp_do_deferred_path_selection(bgp, afi, safi);
 }
@@ -1564,27 +1569,14 @@ void bgp_gr_check_path_select(struct bgp *bgp, afi_t afi, safi_t safi)
 	 */
 	if (bgp_gr_check_all_eors(bgp, afi, safi, &multihop_eors_pending)) {
 		gr_info = &(bgp->gr_info[afi][safi]);
-		if (!BGP_SUPPRESS_FIB_ENABLED(bgp)) {
-			if (gr_info->t_select_deferral) {
-				void *info = EVENT_ARG(gr_info->t_select_deferral);
+		/* Keep the original deadline for initial NHT and FIB responses.
+		 * EOR permits selection, not premature stale-route cleanup.
+		 */
 
-				XFREE(MTYPE_TMP, info);
-			}
-			event_cancel(&gr_info->t_select_deferral);
-		}
-
-		/*
-		 * If there are no pending EORs from multihop peers
-		 * then cancel the timer.
+		/* EOR completes this stage; retain its deadline until the
+		 * remaining NHT and route-processing work has completed.
 		 */
 		if (!multihop_eors_pending) {
-			if (gr_info->t_select_deferral_tier2) {
-				void *info = EVENT_ARG(gr_info->t_select_deferral_tier2);
-
-				XFREE(MTYPE_TMP, info);
-			}
-			event_cancel(&gr_info->t_select_deferral_tier2);
-
 			gr_info->select_defer_over_tier2 = true;
 			if (BGP_DEBUG(graceful_restart, GRACEFUL_RESTART))
 				zlog_debug("%s: No multihop EORs pending for %s, #routes %d -- EORs recvd",
@@ -1730,6 +1722,16 @@ static void bgp_start_deferral_timer(struct bgp *bgp, afi_t afi, safi_t safi,
 	}
 	event_cancel(&gr_info->t_select_deferral_tier2);
 
+	/* Old retries must not select routes before this cycle's EOR. */
+	if (gr_info->t_route_select) {
+		void *info = EVENT_ARG(gr_info->t_route_select);
+
+		XFREE(MTYPE_TMP, info);
+	}
+	event_cancel(&gr_info->t_route_select);
+
+	gr_info->generation++;
+	gr_info->completion_queued = false;
 	gr_info->select_defer_over = false;
 	gr_info->select_defer_over_tier2 = false;
 	gr_info->select_defer_tier2_required = false;

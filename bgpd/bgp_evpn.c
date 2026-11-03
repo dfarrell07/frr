@@ -6059,8 +6059,15 @@ uint16_t bgp_deferred_path_selection(struct bgp *bgp, afi_t afi, safi_t safi,
 		if (!CHECK_FLAG(dest->flags, BGP_NODE_SELECT_DEFER))
 			continue;
 
+		/* An unanswered registration is not a negative reachability result.
+		 * Keep this destination counted until a response or the original
+		 * selection deadline. Known-unreachable paths are processed.
+		 */
+		if (BGP_GR_SELECT_DEFERRAL_TIMER_IS_RUNNING(bgp, afi, safi) &&
+		    bgp_dest_initial_nht_pending(dest))
+			continue;
+
 		UNSET_FLAG(dest->flags, BGP_NODE_SELECT_DEFER);
-		bgp->gr_info[afi][safi].gr_deferred--;
 
 		if (evpn_select) {
 			struct bgp_path_info *pi = bgp_dest_get_bgp_path_info(dest);
@@ -6081,6 +6088,8 @@ uint16_t bgp_deferred_path_selection(struct bgp *bgp, afi_t afi, safi_t safi,
 		} else
 			bgp_process_main_one(bgp, dest, afi, safi);
 
+		/* Nested FIB callbacks must not complete GR before derived work. */
+		bgp->gr_info[afi][safi].gr_deferred--;
 		cnt++;
 	}
 

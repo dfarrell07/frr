@@ -83,6 +83,8 @@ struct bgp_nexthop_cache {
  *                | INCOMPLETE = 0 | INCOMPLETE = 0
  */
 #define BGP_NEXTHOP_EVPN_INCOMPLETE (1 << 8)
+/* Initial response for the current NHT registration is outstanding. */
+#define BGP_NEXTHOP_INITIAL_PENDING (1 << 9)
 
 	uint32_t srte_color;
 

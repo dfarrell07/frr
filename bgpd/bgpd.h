@@ -393,6 +393,9 @@ enum bgp_instance_type {
 
 /* Graceful restart selection deferral timer info */
 struct graceful_restart_info {
+	/* Invalidates completion markers when a new selection cycle starts. */
+	uint64_t generation;
+	bool completion_queued;
 	/* Deferral Timer */
 	struct event *t_select_deferral;
 
