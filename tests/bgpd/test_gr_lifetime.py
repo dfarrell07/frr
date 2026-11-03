@@ -13,6 +13,8 @@ for check in (
     "failed completion send and retry passed",
     "new arm retires old marker and retry passed",
     "direct retirement waits for outer completion passed",
+    "ordinary startup multihop EOR passed",
+    "multihop EOR after startup expiry passed",
     "deleted NHT callback retired passed",
 ):
     TestGRLifetime.onesimple(check)

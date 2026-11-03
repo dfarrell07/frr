@@ -11,6 +11,7 @@
 #include "qobj.h"
 #include "workqueue.h"
 #include "bgpd/bgpd.h"
+#include "bgpd/bgp_bfd.h"
 #include "bgpd/bgp_fsm.h"
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_nexthop.h"
@@ -20,6 +21,7 @@
 #include "bgpd/bgp_zebra.h"
 /* Keep the actual registration and interface-initial callbacks under test. */
 #include "bgpd/bgp_nht.c"
+#include "bgpd/bgp_packet.c"
 #include "bgpd/bgp_evpn_private.h"
 
 struct zebra_privs_t bgpd_privs = {};
@@ -350,6 +352,85 @@ static void test_direct_retirement(void)
 	puts("direct retirement waits for outer completion passed");
 }
 
+static void test_startup_multihop_eor(bool startup_expired)
+{
+	struct bgp *bgp = router();
+	struct graceful_restart_info *gr = &bgp->gr_info[AFI_IP6][SAFI_UNICAST];
+	struct peer_connection direct_connection = {.status = Established};
+	struct peer_connection multihop_connection = {.status = Established};
+	char direct_name[sizeof("direct")] = "direct";
+	char multihop_name[sizeof("multihop")] = "multihop";
+	struct peer direct = {.bgp = bgp, .connection = &direct_connection,
+			      .host = direct_name, .sort = BGP_PEER_EBGP, .ttl = 1,
+			      .local_as = 64512, .as = 64513, .as_type = AS_SPECIFIED};
+	struct peer multihop = {.bgp = bgp, .connection = &multihop_connection,
+				.host = multihop_name, .sort = BGP_PEER_EBGP, .ttl = 2,
+				.local_as = 64512, .as = 64513, .as_type = AS_SPECIFIED};
+	struct bgp_nexthop_cache nht = {.bgp = bgp};
+	struct bgp_path_info path = {.nexthop = &nht};
+	struct zapi_route response = {.type = ZEBRA_ROUTE_CONNECT, .safi = SAFI_UNICAST};
+	struct event *deadline, *tier2;
+	struct bgp_dest *dest;
+	struct prefix prefix;
+	struct capture capture = {};
+	int fd = attach_socket();
+
+	/* Ordinary configured startup leaves the daemon-wide GR flag clear. */
+	assert(!CHECK_FLAG(bm->flags, BM_FLAG_GRACEFUL_RESTART));
+	direct_connection.peer = &direct;
+	multihop_connection.peer = &multihop;
+	direct.flags = multihop.flags = PEER_FLAG_CONFIG_NODE | PEER_FLAG_GRACEFUL_RESTART;
+	direct.afc[AFI_IP6][SAFI_UNICAST] = multihop.afc[AFI_IP6][SAFI_UNICAST] = 1;
+	direct.af_sflags[AFI_IP6][SAFI_UNICAST] = PEER_STATUS_GR_WAIT_EOR;
+	multihop.af_sflags[AFI_IP6][SAFI_UNICAST] = PEER_STATUS_GR_WAIT_EOR;
+	assert(!PEER_IS_MULTIHOP(&direct) && PEER_IS_MULTIHOP(&multihop));
+	listnode_add(bgp->peer, &direct);
+	listnode_add(bgp->peer, &multihop);
+	bgp->gr_multihop_peer_exists = true;
+	bgp->select_defer_time = 30;
+	event_cancel(&bgp->t_startup);
+	event_add_timer(master, end_period, NULL, 30, &bgp->t_startup);
+	bgp_gr_start_all_deferral_timers(bgp);
+	deadline = gr->t_select_deferral;
+	assert(deadline);
+	assert(str2prefix("2001:db8:e0f::/64", &prefix));
+	dest = bgp_node_get(bgp->rib[AFI_IP6][SAFI_UNICAST], &prefix);
+	bgp_dest_set_bgp_path_info(dest, &path);
+	SET_FLAG(nht.flags, BGP_NEXTHOP_INITIAL_PENDING);
+	SET_FLAG(dest->flags, BGP_NODE_SELECT_DEFER);
+	gr->gr_deferred = 1;
+	bgp_update_receive_eor(bgp, &direct, AFI_IP6, SAFI_UNICAST);
+	tier2 = gr->t_select_deferral_tier2;
+	assert(gr->select_defer_over && gr->select_defer_tier2_required && tier2);
+	assert(!gr->select_defer_over_tier2 && !gr->route_sync_tier2);
+	if (startup_expired)
+		event_cancel(&bgp->t_startup);
+	bgp_update_receive_eor(bgp, &multihop, AFI_IP6, SAFI_UNICAST);
+	assert(gr->select_defer_over_tier2 && BGP_GR_SELECT_DEFER_DONE(bgp, AFI_IP6, SAFI_UNICAST));
+	pump(100, fd, &capture, 0, 0);
+	assert(!capture.completes && !gr->route_sync_tier2 && gr->gr_deferred == 1);
+	assert(gr->t_select_deferral == deadline && gr->t_select_deferral_tier2 == tier2);
+
+	/* A known negative reply ends initial uncertainty; the original retry
+	 * retires this now-pathless prefix and drains the real COMPLETE fence.
+	 */
+	LIST_INIT(&nht.paths);
+	response.prefix = prefix;
+	bgp_process_nexthop_update(&nht, &response, false);
+	bgp_dest_set_bgp_path_info(dest, NULL);
+	pump(1200, fd, &capture, 0, 0);
+	assert(!gr->gr_deferred && gr->route_sync_tier2 && capture.completes == 1);
+	assert(!gr->t_select_deferral && !gr->t_select_deferral_tier2);
+	bgp_dest_unlock_node(dest);
+	listnode_delete(bgp->peer, &direct);
+	listnode_delete(bgp->peer, &multihop);
+	delete_router(bgp, QOBJ_ID(bgp));
+	zclient_stop(bgp_zclient);
+	close(fd);
+	puts(startup_expired ? "multihop EOR after startup expiry passed"
+			     : "ordinary startup multihop EOR passed");
+}
+
 int main(int argc, char **argv)
 {
 	/* Same real daemon setup as test_peer_attr; no listener or Zebra server. */
@@ -383,6 +464,10 @@ int main(int argc, char **argv)
 		test_new_arm();
 	if (argc == 1 || !strcmp(argv[1], "retirement"))
 		test_direct_retirement();
+	if (argc == 1 || !strcmp(argv[1], "startup-eor"))
+		test_startup_multihop_eor(false);
+	if (argc == 1 || !strcmp(argv[1], "expired-startup-eor"))
+		test_startup_multihop_eor(true);
 	if (argc == 1 || !strcmp(argv[1], "nht"))
 		test_deleted_nht_callback();
 	bgp_pthreads_finish();

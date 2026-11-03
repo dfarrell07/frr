@@ -2303,14 +2303,12 @@ static void bgp_update_receive_eor(struct bgp *bgp, struct peer *peer, afi_t afi
 		/* graceful-restart related processing */
 		UNSET_FLAG(peer->af_sflags[afi][safi], PEER_STATUS_GR_WAIT_EOR);
 
+		/* Configured startup can defer tier 2 without the global GR flag. */
 		if ((bgp->t_startup || bgp_in_graceful_restart() ||
-		     BGP_MULTIHOP_GR_PENDING(bgp, afi, safi)) &&
+		     BGP_MULTIHOP_GR_PENDING(bgp, afi, safi) ||
+		     BGP_GR_SELECT_DEFERRAL_TIMER_IS_RUNNING(bgp, afi, safi)) &&
 		    bgp_gr_supported_for_afi_safi(afi, safi)) {
-			struct graceful_restart_info *gr_info;
-
-			gr_info = &(bgp->gr_info[afi][safi]);
-			if (!gr_info->select_defer_over ||
-			    BGP_MULTIHOP_GR_PENDING(bgp, afi, safi)) {
+			if (!BGP_GR_SELECT_DEFER_DONE(bgp, afi, safi)) {
 				if (BGP_DEBUG(graceful_restart, GRACEFUL_RESTART))
 					zlog_debug("%s: check for deferred path-selection",
 						   bgp->name_pretty);
