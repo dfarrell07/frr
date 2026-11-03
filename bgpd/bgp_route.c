@@ -4717,9 +4717,72 @@ void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, saf
 	return;
 }
 
+bool bgp_dest_initial_nht_pending(struct bgp_dest *dest)
+{
+	struct bgp_path_info *pi;
+	bool pending = false;
+
+	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
+		if (CHECK_FLAG(pi->flags, BGP_PATH_REMOVED | BGP_PATH_HISTORY))
+			continue;
+		/* A usable alternate already preserves this prefix's forwarding. */
+		if (!BGP_PATH_HOLDDOWN(pi) && pi->peer &&
+		    (!pi->nexthop ||
+		     !CHECK_FLAG(pi->nexthop->flags, BGP_NEXTHOP_INITIAL_PENDING)) &&
+		    (pi->peer == pi->peer->bgp->peer_self ||
+		     peer_established(pi->peer->connection) ||
+		     CHECK_FLAG(pi->peer->sflags, PEER_STATUS_NSF_WAIT)))
+			return false;
+		if (pi->nexthop && CHECK_FLAG(pi->nexthop->flags, BGP_NEXTHOP_INITIAL_PENDING))
+			pending = true;
+	}
+	return pending;
+}
+
+static bool bgp_table_initial_nht_pending(struct bgp_table *table)
+{
+	struct bgp_dest *dest;
+
+	if (!table)
+		return false;
+	for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
+		if (bgp_dest_initial_nht_pending(dest)) {
+			bgp_dest_unlock_node(dest);
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool bgp_gr_initial_nht_pending(struct bgp *bgp, afi_t afi, safi_t safi)
+{
+	struct bgp_table *table = bgp->rib[afi][safi];
+	struct bgp_dest *rd;
+
+	if (!table)
+		return false;
+	if (safi != SAFI_EVPN)
+		return bgp_table_initial_nht_pending(table);
+	for (rd = bgp_table_top(table); rd; rd = bgp_route_next(rd)) {
+		if (bgp_table_initial_nht_pending(bgp_dest_get_bgp_table_info(rd))) {
+			bgp_dest_unlock_node(rd);
+			return true;
+		}
+	}
+	return false;
+}
+
+static inline void bgp_gr_start_route_select_timer(struct bgp *bgp, afi_t afi, safi_t safi);
+
 void bgp_process_gr_deferral_complete(struct bgp *bgp, afi_t afi, safi_t safi)
 {
+	struct graceful_restart_info *gr = &bgp->gr_info[afi][safi];
+	struct event **timers[] = {&gr->t_select_deferral, &gr->t_select_deferral_tier2,
+				  &gr->t_route_select};
 	bool route_sync_pending = false;
+
+	if (CHECK_FLAG(bgp->flags, BGP_FLAG_DELETE_IN_PROGRESS))
+		return;
 
 	bgp_send_delayed_eor(bgp);
 
@@ -4729,13 +4792,40 @@ void bgp_process_gr_deferral_complete(struct bgp *bgp, afi_t afi, safi_t safi)
 	 */
 	bgp_gr_start_tier2_timer_if_required(bgp, afi, safi);
 
-	/* Send route processing complete message to RIB */
-	if (!bgp->gr_info[afi][safi].route_sync_tier2 && BGP_GR_SELECT_DEFER_DONE(bgp, afi, safi)) {
-		bgp_zebra_update(bgp, afi, safi, ZEBRA_CLIENT_ROUTE_UPDATE_COMPLETE);
-		bgp->gr_info[afi][safi].route_sync_tier2 = true;
+	gr->route_sync = true;
+	if (gr->route_sync_tier2 || !BGP_GR_SELECT_DEFER_DONE(bgp, afi, safi))
+		return;
+
+	/* EOR permits selection, but the initial NHT reply can still create
+	 * route work. Wait for both Zebra queues through their shared count.
+	 * Keep the original deadline as the bound on this additional wait.
+	 * Coalesce repeated notifications on the existing selection retry.
+	 */
+	if (gr->gr_deferred ||
+	    (BGP_SUPPRESS_FIB_ENABLED(bgp) && event_is_scheduled(gr->t_select_deferral) &&
+	     gr->gr_route_fib_install_pending_cnt) ||
+	    (BGP_GR_SELECT_DEFERRAL_TIMER_IS_RUNNING(bgp, afi, safi) &&
+	     ((bgp->mq && bgp->mq->size) || bgp->zebra_announce_queue_cnt ||
+	      event_is_scheduled(gr->t_route_select) ||
+	      bgp_gr_initial_nht_pending(bgp, afi, safi)))) {
+		bgp_gr_start_route_select_timer(bgp, afi, safi);
+		return;
 	}
 
-	bgp->gr_info[afi][safi].route_sync = true;
+	if (bgp_zebra_update(bgp, afi, safi, ZEBRA_CLIENT_ROUTE_UPDATE_COMPLETE) !=
+	    BGP_GR_SUCCESS) {
+		bgp_gr_start_route_select_timer(bgp, afi, safi);
+		return;
+	}
+	gr->route_sync_tier2 = true;
+	for (size_t i = 0; i < array_size(timers); i++) {
+		if (event_is_scheduled(*timers[i])) {
+			void *info = EVENT_ARG(*timers[i]);
+
+			XFREE(MTYPE_TMP, info);
+		}
+		event_cancel(timers[i]);
+	}
 	/*
 	 * If this instance is all done,
 	 * check for GR completion overall
@@ -4822,14 +4912,6 @@ void bgp_dest_decrement_gr_fib_install_pending_count(struct bgp_dest *dest)
 	if (!bgp->gr_info[afi][safi].gr_deferred &&
 	    !bgp->gr_info[afi][safi].gr_route_fib_install_pending_cnt &&
 	    bgp->gr_route_sync_pending) {
-		struct graceful_restart_info *gr_info = &(bgp->gr_info[afi][safi]);
-
-		if (event_is_scheduled(gr_info->t_select_deferral)) {
-			void *info = EVENT_ARG(gr_info->t_select_deferral);
-
-			XFREE(MTYPE_TMP, info);
-		}
-		event_cancel(&gr_info->t_select_deferral);
 		if (BGP_DEBUG(graceful_restart, GRACEFUL_RESTART))
 			zlog_debug("%s: Triggering GR deferral completion from FIB notification for %s",
 				   bgp->name_pretty, get_afi_safi_str(afi, safi, false));
@@ -4899,6 +4981,9 @@ static void bgp_gr_start_tier2_timer_if_required(struct bgp *bgp, afi_t afi, saf
 static inline void bgp_gr_start_route_select_timer(struct bgp *bgp, afi_t afi, safi_t safi)
 {
 	struct afi_safi_info *thread_info;
+
+	if (event_is_scheduled(bgp->gr_info[afi][safi].t_route_select))
+		return;
 
 	thread_info = XMALLOC(MTYPE_TMP, sizeof(struct afi_safi_info));
 

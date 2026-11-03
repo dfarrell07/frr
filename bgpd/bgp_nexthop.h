@@ -83,6 +83,8 @@ struct bgp_nexthop_cache {
  *                | INCOMPLETE = 0 | INCOMPLETE = 0
  */
 #define BGP_NEXTHOP_EVPN_INCOMPLETE (1 << 8)
+/* No reply has arrived for the current Zebra registration yet. */
+#define BGP_NEXTHOP_INITIAL_PENDING (1 << 9)
 
 	uint32_t srte_color;
 

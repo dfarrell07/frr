@@ -138,3 +138,12 @@ tests_bgpd_test_unencodable_withdraw_CPPFLAGS = $(TESTS_CPPFLAGS)
 tests_bgpd_test_unencodable_withdraw_LDADD = $(BGP_TEST_LDADD)
 tests_bgpd_test_unencodable_withdraw_SOURCES = tests/bgpd/test_unencodable_withdraw.c
 EXTRA_DIST += tests/bgpd/test_unencodable_withdraw.py
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_gr_replay
+endif
+tests_bgpd_test_gr_replay_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_gr_replay_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_gr_replay_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_gr_replay_SOURCES = tests/bgpd/test_gr_replay.c
+EXTRA_DIST += tests/bgpd/test_gr_replay.py
